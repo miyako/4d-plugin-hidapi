@@ -1,0 +1,51 @@
+{
+    "name": "HIDAPI",
+    "id": 20000,
+    "commands": [
+        {
+            "theme": "HIDAPI",
+            "syntax": "hid_enumerate:C",
+            "threadSafe": true
+        },
+        {
+            "theme": "HIDAPI",
+            "syntax": "hid_open(&L;&L;&T):J",
+            "threadSafe": true
+        },
+        {
+            "theme": "HIDAPI",
+            "syntax": "hid_open_path(&T):J",
+            "threadSafe": true
+        },
+        {
+            "theme": "HIDAPI",
+            "syntax": "hid_close(&L)",
+            "threadSafe": true
+        },
+        {
+            "theme": "HIDAPI",
+            "syntax": "hid_write(&L;&O):J",
+            "threadSafe": true
+        },
+        {
+            "theme": "HIDAPI",
+            "syntax": "hid_read(&L;&O;&L):J",
+            "threadSafe": true
+        },
+        {
+            "theme": "HIDAPI",
+            "syntax": "hid_send_feature_report(&L;&O):J",
+            "threadSafe": true
+        },
+        {
+            "theme": "HIDAPI",
+            "syntax": "hid_get_feature_report(&L;&O):J",
+            "threadSafe": true
+        },
+        {
+            "theme": "HIDAPI",
+            "syntax": "hid_set_nonblocking(&L;&L):J",
+            "threadSafe": true
+        }
+    ]
+}

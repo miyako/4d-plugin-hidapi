@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no" ?>
+<xliff version="1.0" xmlns:d4="http://www.4d.com/d4-ns">
+    <header>
+        <note>HIDAPI</note>
+    </header>
+    <group resname="themes">
+        <trans-unit id="" resname="E4E3041A2240459082D3AF32E8146873" translate="no">
+            <source>HIDAPI</source>
+        </trans-unit>
+    </group>
+    <group restype="x-4DK#" d4:groupName="E4E3041A2240459082D3AF32E8146873">
+        <trans-unit d4:value="-1:L" id="E4E3041A2240459082D3AF32E8146873.1">
+      <source>HIDAPI_WAIT_BLOCKING</source>
+    </trans-unit>
+    </group>
+</xliff>
