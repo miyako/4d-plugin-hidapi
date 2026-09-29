@@ -10,11 +10,23 @@
 
 #include "4DPlugin-HIDAPI.h"
 
+#include <atomic>
+
 #pragma mark -
 
+/*
+ globalMutex : guards hid_devices, next_device_id and all I/O on an open device
+ enumMutex   : serializes hid_enumerate / hid_open / hid_open_path, which on macOS
+               share the process-global IOHIDManager inside hidapi
+ lock order  : enumMutex is never held while waiting for globalMutex
+ */
 std::mutex globalMutex;
+std::mutex enumMutex;
 
-std::map<uint32_t, hid_device *> __hid_devices;
+std::map<uint32_t, hid_device *> hid_devices;
+uint32_t next_device_id = 1;
+
+std::atomic<bool> is_libhidusb_ready(false);
 
 void PluginMain(PA_long32 selector, PA_PluginParameters params) {
     
@@ -72,8 +84,6 @@ void PluginMain(PA_long32 selector, PA_PluginParameters params) {
 
 #pragma mark -
 
-bool is_libhidusb_ready = false;
-
 void OnStartup() {
     
     is_libhidusb_ready = (0 == hid_init());
@@ -82,12 +92,83 @@ void OnStartup() {
 
 void OnExit() {
     
-    if(is_libhidusb_ready) {
-        hid_exit();
-        __hid_devices.clear();
+    bool was_ready = is_libhidusb_ready.exchange(false);
+    
+    /*
+     try_lock: if a preemptive process is stuck in a blocking hid_read at quit,
+     waiting here would freeze 4D on exit; in that case leave the devices alone
+     */
+    std::unique_lock<std::mutex> lock(globalMutex, std::try_to_lock);
+    
+    if(lock.owns_lock()) {
+        
+        for(std::map<uint32_t, hid_device*>::iterator it = hid_devices.begin(); it != hid_devices.end(); ++it) {
+            hid_close(it->second);
+        }
+        hid_devices.clear();
+        
+        if(was_ready) {
+            hid_exit();
+        }
     }
 
 }
+
+#pragma mark -
+
+static uint32_t register_device(hid_device *device) {
+    
+    /* caller must hold globalMutex */
+    
+    while ((next_device_id == 0) || (hid_devices.find(next_device_id) != hid_devices.end())) {
+        next_device_id++;
+    }
+    
+    uint32_t i = next_device_id++;
+    
+    hid_devices.insert(std::map<uint32_t, hid_device*>::value_type(i, device));
+    
+    return i;
+}
+
+static void set_device_strings(PA_ObjectRef returnValue, hid_device *device) {
+    
+    std::vector<wchar_t>buf(STRING_BUFFER_LENGTH + 1);
+    
+    if(0 == hid_get_manufacturer_string(device, &buf[0], STRING_BUFFER_LENGTH)) {
+        ob_set_a(returnValue, L"manufacturer_string", (const wchar_t *)&buf[0]);
+    }
+    
+    memset(&buf[0], 0, sizeof(wchar_t) * buf.size());
+    
+    if(0 == hid_get_product_string(device, &buf[0], STRING_BUFFER_LENGTH)) {
+        ob_set_a(returnValue, L"product_string", (const wchar_t *)&buf[0]);
+    }
+    
+    memset(&buf[0], 0, sizeof(wchar_t) * buf.size());
+    
+    if(0 == hid_get_serial_number_string(device, &buf[0], STRING_BUFFER_LENGTH)) {
+        ob_set_a(returnValue, L"serial_number_string", (const wchar_t *)&buf[0]);
+    }
+}
+
+static void set_status(PA_ObjectRef returnValue, hid_device *device, int status) {
+    
+    /* hid_write/hid_read/feature reports: bytes transferred, or -1 on error */
+    
+    ob_set_b(returnValue, L"success", status >= 0);
+    
+    if(status < 0) {
+        ob_set_a(returnValue, L"error", hid_error(device));
+    }else{
+        ob_set_n(returnValue, L"length", status);
+    }
+}
+
+#define ERROR_NOT_READY L"hidapi is not initialized"
+#define ERROR_INVALID_DEVICE L"invalid device"
+#define ERROR_EMPTY_BUFFER L"data must contain at least 1 byte (the report ID)"
+#define ERROR_EXCEPTION L"unexpected exception"
 
 #pragma mark -
 
@@ -95,16 +176,18 @@ void hid_enumerate(PA_PluginParameters params) {
     
     PA_CollectionRef devices = PA_CreateCollection();
     
-    if(is_libhidusb_ready) {
+    try {
         
-        hid_device_info *info = hid_enumerate(0, 0);
-        
-        if(info) {
+        if(is_libhidusb_ready) {
             
-            while (info) {
+            std::lock_guard<std::mutex> lock(enumMutex);
+            
+            hid_device_info *head = hid_enumerate(0, 0);
+            
+            for(hid_device_info *info = head; info; info = info->next) {
                 
-                PA_CollectionRef device = PA_CreateObject();
-
+                PA_ObjectRef device = PA_CreateObject();
+                
                 ob_set_s(device, L"path", info->path);
                 ob_set_n(device, L"vendor_id", info->vendor_id);
                 ob_set_n(device, L"product_id", info->product_id);
@@ -120,12 +203,13 @@ void hid_enumerate(PA_PluginParameters params) {
                 PA_SetObjectVariable(&v, device);
                 PA_SetCollectionElement(devices, PA_GetCollectionLength(devices), v);
                 PA_ClearVariable(&v);
-                
-                info = info->next;
             }
             
-            hid_free_enumeration(info);
+            hid_free_enumeration(head);
         }
+        
+    } catch(...) {
+        
     }
     
     PA_ReturnCollection(params, devices);
@@ -138,87 +222,78 @@ void hid_open(PA_PluginParameters params) {
     
     ob_set_b(returnValue, L"success", false);
     
-    if(is_libhidusb_ready) {
+    try {
         
-        PackagePtr pParams = (PackagePtr)params->fParameters;
-        
-        C_LONGINT Param1;
-        C_LONGINT Param2;
-        C_TEXT Param3;
-
-        Param1.fromParamAtIndex(pParams, 1);
-        Param2.fromParamAtIndex(pParams, 2);
-        Param3.fromParamAtIndex(pParams, 3);
-        
-        unsigned short vendor_id = Param1.getIntValue();
-        unsigned short product_id = Param2.getIntValue();
+        if(is_libhidusb_ready) {
+            
+            PackagePtr pParams = (PackagePtr)params->fParameters;
+            
+            C_LONGINT Param1;
+            C_LONGINT Param2;
+            C_TEXT Param3;
+            
+            Param1.fromParamAtIndex(pParams, 1);
+            Param2.fromParamAtIndex(pParams, 2);
+            Param3.fromParamAtIndex(pParams, 3);
+            
+            unsigned short vendor_id = Param1.getIntValue();
+            unsigned short product_id = Param2.getIntValue();
+            
+            const wchar_t *serial_number = NULL;
+            size_t len = Param3.getUTF16Length();
+            
+            std::vector<char> buf((len+1) * sizeof(wchar_t));
+            
+            if(len) {
                 
-        const wchar_t *serial_number = NULL;
-        size_t len = Param3.getUTF16Length();
-        
-        std::vector<char> buf((len+1) * sizeof(wchar_t));
-        
-        if(len) {
-            
-            #if VERSIONWIN
-                    serial_number = Param3.getUTF16StringPtr();
-            #else
-                    CFStringRef str = CFStringCreateWithBytes(kCFAllocatorDefault,
-                                                              (const UInt8 *)Param3.getUTF16StringPtr(),
-                                                              sizeof(PA_Unichar) * Param3.getUTF16Length(),
-                                                              kCFStringEncodingUTF16LE,
-                                                              true);
-                    if(str){
-                                                
-                        if(CFStringGetCString(str,
-                                              &buf[0],
-                                              buf.size(),
-                                              kCFStringEncodingUTF32)){
-                            serial_number = (const wchar_t *)&buf[0];
-                        }
-                        CFRelease(str);
+#if VERSIONWIN
+                serial_number = Param3.getUTF16StringPtr();
+#else
+                CFStringRef str = CFStringCreateWithBytes(kCFAllocatorDefault,
+                                                          (const UInt8 *)Param3.getUTF16StringPtr(),
+                                                          sizeof(PA_Unichar) * Param3.getUTF16Length(),
+                                                          kCFStringEncodingUTF16LE,
+                                                          true);
+                if(str){
+                    
+                    if(CFStringGetCString(str,
+                                          &buf[0],
+                                          buf.size(),
+                                          kCFStringEncodingUTF32)){
+                        serial_number = (const wchar_t *)&buf[0];
                     }
-            #endif
+                    CFRelease(str);
+                }
+#endif
+            }
+            
+            hid_device *device = NULL;
+            
+            {
+                /* released before globalMutex is taken (see lock order) */
+                std::lock_guard<std::mutex> enumLock(enumMutex);
+                device = hid_open(vendor_id,
+                                  product_id,
+                                  serial_number);
+            }
+            
+            if(device) {
+                
+                std::lock_guard<std::mutex> lock(globalMutex);
+                
+                uint32_t i = register_device(device);
+                
+                ob_set_n(returnValue, L"device", i);
+                ob_set_b(returnValue, L"success", true);
+                
+                set_device_strings(returnValue, device);
+            }
+        }else{
+            ob_set_a(returnValue, L"error", ERROR_NOT_READY);
         }
-
-        hid_device *device = hid_open(vendor_id,
-                                      product_id,
-                                      serial_number);
         
-        if(device) {
-            
-            std::lock_guard<std::mutex> lock(globalMutex);
-            
-            unsigned int i = 1;
-            
-            while (__hid_devices.find(i) != __hid_devices.end()) {
-                i++;
-            }
-            
-            __hid_devices.insert(std::map<uint32_t, hid_device*>::value_type(i, device));
-         
-            ob_set_n(returnValue, L"device", i);
-            ob_set_b(returnValue, L"success", true);
-            
-            std::vector<wchar_t>buf(STRING_BUFFER_LENGTH + 1);
-            
-            if(0 == hid_get_manufacturer_string(device, &buf[0], STRING_BUFFER_LENGTH)) {
-                ob_set_a(returnValue, L"manufacturer_string", (const wchar_t *)&buf[0]);
-            }
-            
-            memset(&buf[0], 0, sizeof(wchar_t) * buf.size());
-            
-            if(0 == hid_get_product_string(device, &buf[0], STRING_BUFFER_LENGTH)) {
-                ob_set_a(returnValue, L"product_string", (const wchar_t *)&buf[0]);
-            }
-            
-            memset(&buf[0], 0, sizeof(wchar_t) * buf.size());
-            
-            if(0 == hid_get_serial_number_string(device, &buf[0], STRING_BUFFER_LENGTH)) {
-                ob_set_a(returnValue, L"serial_number_string", (const wchar_t *)&buf[0]);
-            }
-            
-        }
+    } catch(...) {
+        ob_set_a(returnValue, L"error", ERROR_EXCEPTION);
     }
     
     PA_ReturnObject(params, returnValue);
@@ -230,113 +305,112 @@ void hid_open_path(PA_PluginParameters params) {
     
     ob_set_b(returnValue, L"success", false);
     
-    if(is_libhidusb_ready) {
+    try {
         
-        PackagePtr pParams = (PackagePtr)params->fParameters;
-        
-        C_TEXT Param1;
-
-        Param1.fromParamAtIndex(pParams, 1);
-                
-        CUTF8String _path;
-
-        Param1.copyUTF8String(&_path);
-        
-        const char *path = (const char *)_path.c_str();
-    
-        hid_device *device = hid_open_path(path);
-        
-        if(device) {
+        if(is_libhidusb_ready) {
             
-            std::lock_guard<std::mutex> lock(globalMutex);
+            PackagePtr pParams = (PackagePtr)params->fParameters;
             
-            unsigned int i = 1;
+            C_TEXT Param1;
             
-            while (__hid_devices.find(i) != __hid_devices.end()) {
-                i++;
+            Param1.fromParamAtIndex(pParams, 1);
+            
+            CUTF8String _path;
+            
+            Param1.copyUTF8String(&_path);
+            
+            const char *path = (const char *)_path.c_str();
+            
+            hid_device *device = NULL;
+            
+            {
+                /* released before globalMutex is taken (see lock order) */
+                std::lock_guard<std::mutex> enumLock(enumMutex);
+                device = hid_open_path(path);
             }
             
-            __hid_devices.insert(std::map<uint32_t, hid_device*>::value_type(i, device));
-         
-            ob_set_n(returnValue, L"device", i);
-            ob_set_b(returnValue, L"success", true);
-            
-            std::vector<wchar_t>buf(STRING_BUFFER_LENGTH + 1);
-            
-            if(0 == hid_get_manufacturer_string(device, &buf[0], STRING_BUFFER_LENGTH)) {
-                ob_set_a(returnValue, L"manufacturer_string", (const wchar_t *)&buf[0]);
+            if(device) {
+                
+                std::lock_guard<std::mutex> lock(globalMutex);
+                
+                uint32_t i = register_device(device);
+                
+                ob_set_n(returnValue, L"device", i);
+                ob_set_b(returnValue, L"success", true);
+                
+                set_device_strings(returnValue, device);
+                
+                /*
+                 
+                 NOTE: this disabled block has known bugs; fix before enabling
+                 - on macOS, signal11 hid_get_indexed_string() is a stub that always
+                   returns 0 without writing, so the while() below never ends
+                 - indexed_string_value points to buf (UTF-32) instead of _buf,
+                   and _buf goes out of scope before it is used
+                 - on Windows, const wchar_t * is assigned to PA_Unichar * (no compile)
+                 
+                 int string_index = 0;
+                 
+                 memset(&buf[0], 0, sizeof(wchar_t) * buf.size());
+                 
+                 PA_CollectionRef indexed_string = PA_CreateCollection();
+                 
+                 PA_Unichar *indexed_string_value = NULL;
+                 
+                 std::wstring wstr;
+                 
+                 while (0 == hid_get_indexed_string(device, string_index, &buf[0], STRING_BUFFER_LENGTH)) {
+                 
+                 string_index++;
+                 
+                 wstr = std::wstring((const wchar_t *)&buf[0], wcslen((const wchar_t *)&buf[0]));
+                 
+                 #if VERSIONWIN
+                 indexed_string_value = wstr.c_str();
+                 #else
+                 
+                 CFStringRef str = CFStringCreateWithBytes(kCFAllocatorDefault,
+                 (const UInt8 *)wstr.c_str(),
+                 sizeof(wchar_t) * wstr.length(),
+                 kCFStringEncodingUTF32,
+                 true);
+                 if(str){
+                 
+                 std::vector<PA_Unichar>_buf(wstr.length() + 1);
+                 
+                 if(CFStringGetCString(str,
+                 (char *)&_buf[0],
+                 sizeof(PA_Unichar) * _buf.size(),
+                 kCFStringEncodingUTF16LE)){
+                 indexed_string_value = (PA_Unichar *)&buf[0];
+                 }
+                 
+                 CFRelease(str);
+                 }
+                 #endif
+                 
+                 PA_Variable v = PA_CreateVariable(eVK_Unistring);
+                 PA_Unistring u = PA_CreateUnistring(indexed_string_value);
+                 PA_SetStringVariable(&v, &u);
+                 
+                 PA_SetCollectionElement(indexed_string, PA_GetCollectionLength(indexed_string), v);
+                 
+                 PA_DisposeUnistring(&u);
+                 PA_ClearVariable(&v);
+                 
+                 memset(&buf[0], 0, sizeof(wchar_t) * buf.size());
+                 
+                 }
+                 ob_set_c(returnValue, L"indexed_string", indexed_string);
+                 */
             }
             
-            memset(&buf[0], 0, sizeof(wchar_t) * buf.size());
-            
-            if(0 == hid_get_product_string(device, &buf[0], STRING_BUFFER_LENGTH)) {
-                ob_set_a(returnValue, L"product_string", (const wchar_t *)&buf[0]);
-            }
-            
-            memset(&buf[0], 0, sizeof(wchar_t) * buf.size());
-            
-            if(0 == hid_get_serial_number_string(device, &buf[0], STRING_BUFFER_LENGTH)) {
-                ob_set_a(returnValue, L"serial_number_string", (const wchar_t *)&buf[0]);
-            }
-            
-            /*
-            
-            int string_index = 0;
-            
-            memset(&buf[0], 0, sizeof(wchar_t) * buf.size());
-            
-            PA_CollectionRef indexed_string = PA_CreateCollection();
-            
-            PA_Unichar *indexed_string_value = NULL;
-            
-            std::wstring wstr;
-            
-            while (0 == hid_get_indexed_string(device, string_index, &buf[0], STRING_BUFFER_LENGTH)) {
-                
-                string_index++;
-                
-                wstr = std::wstring((const wchar_t *)&buf[0], wcslen((const wchar_t *)&buf[0]));
-                
-                #if VERSIONWIN
-                        indexed_string_value = wstr.c_str();
-                #else
-                        
-                        CFStringRef str = CFStringCreateWithBytes(kCFAllocatorDefault,
-                                                                  (const UInt8 *)wstr.c_str(),
-                                                                  sizeof(wchar_t) * wstr.length(),
-                                                                  kCFStringEncodingUTF32,
-                                                                  true);
-                        if(str){
-                            
-                            std::vector<PA_Unichar>_buf(wstr.length() + 1);
-                                                    
-                            if(CFStringGetCString(str,
-                                                  (char *)&_buf[0],
-                                                  sizeof(PA_Unichar) * _buf.size(),
-                                                  kCFStringEncodingUTF16LE)){
-                                indexed_string_value = (PA_Unichar *)&buf[0];
-                            }
-                            
-                            CFRelease(str);
-                        }
-                #endif
-                
-                PA_Variable v = PA_CreateVariable(eVK_Unistring);
-                PA_Unistring u = PA_CreateUnistring(indexed_string_value);
-                PA_SetStringVariable(&v, &u);
-                
-                PA_SetCollectionElement(indexed_string, PA_GetCollectionLength(indexed_string), v);
-
-                PA_DisposeUnistring(&u);
-                PA_ClearVariable(&v);
-                
-                memset(&buf[0], 0, sizeof(wchar_t) * buf.size());
-                
-            }
-            ob_set_c(returnValue, L"indexed_string", indexed_string);
-            */
+        }else{
+            ob_set_a(returnValue, L"error", ERROR_NOT_READY);
         }
         
+    } catch(...) {
+        ob_set_a(returnValue, L"error", ERROR_EXCEPTION);
     }
     
     PA_ReturnObject(params, returnValue);
@@ -354,12 +428,14 @@ void hid_close(PA_PluginParameters params) {
         
         std::lock_guard<std::mutex> lock(globalMutex);
         
-        hid_device *device = NULL;
+        std::map<uint32_t, hid_device*>::iterator pos = hid_devices.find(Param1.getIntValue());
         
-        std::map<uint32_t, hid_device*>::iterator pos = __hid_devices.find(Param1.getIntValue());
-        
-        if(pos != __hid_devices.end()) {
-            device = pos->second;
+        if(pos != hid_devices.end()) {
+            
+            hid_device *device = pos->second;
+            
+            /* remove first: the handle must never be reachable once freed */
+            hid_devices.erase(pos);
             
             hid_close(device);
         }
@@ -379,39 +455,41 @@ void hid_write(PA_PluginParameters params) {
     
     ob_set_b(returnValue, L"success", false);
     
-    if(is_libhidusb_ready) {
-
-        Param1.fromParamAtIndex(pParams, 1);
-        Param2.fromParamAtIndex(pParams, 2);
-
-        std::lock_guard<std::mutex> lock(globalMutex);
+    try {
         
-        hid_device *device = NULL;
-        
-        std::map<uint32_t, hid_device*>::iterator pos = __hid_devices.find(Param1.getIntValue());
-        
-        if(pos != __hid_devices.end()) {
-
-            device = pos->second;
-
-            unsigned char *data = (unsigned char *)Param2.getBytesPtr();
-            size_t length = Param2.getBytesLength();
-            int status = 0;
+        if(is_libhidusb_ready) {
             
-            status = hid_write(device,
-                               data,
-                               length);
+            Param1.fromParamAtIndex(pParams, 1);
+            Param2.fromParamAtIndex(pParams, 2);
             
-            ob_set_b(returnValue, L"success", 0 == status);
+            std::lock_guard<std::mutex> lock(globalMutex);
             
-            if(0 != status) {
+            std::map<uint32_t, hid_device*>::iterator pos = hid_devices.find(Param1.getIntValue());
+            
+            if(pos != hid_devices.end()) {
                 
-                ob_set_a(returnValue, L"error", hid_error(device));
+                hid_device *device = pos->second;
                 
+                const unsigned char *data = (const unsigned char *)Param2.getBytesPtr();
+                size_t length = Param2.getBytesLength();
+                
+                if((length == 0) || (data == NULL)) {
+                    ob_set_a(returnValue, L"error", ERROR_EMPTY_BUFFER);
+                }else{
+                    int status = hid_write(device, data, length);
+                    set_status(returnValue, device, status);
+                }
+                
+            }else{
+                ob_set_a(returnValue, L"error", ERROR_INVALID_DEVICE);
             }
-                        
+            
+        }else{
+            ob_set_a(returnValue, L"error", ERROR_NOT_READY);
         }
         
+    } catch(...) {
+        ob_set_a(returnValue, L"error", ERROR_EXCEPTION);
     }
         
     PA_ReturnObject(params, returnValue);
@@ -429,56 +507,64 @@ void hid_read(PA_PluginParameters params) {
     
     ob_set_b(returnValue, L"success", false);
     
-    if(is_libhidusb_ready) {
-
-        Param1.fromParamAtIndex(pParams, 1);
-        Param2.fromParamAtIndex(pParams, 2);
-        Param3.fromParamAtIndex(pParams, 3);
-
-        std::lock_guard<std::mutex> lock(globalMutex);
+    try {
         
-        hid_device *device = NULL;
-        
-        std::map<uint32_t, hid_device*>::iterator pos = __hid_devices.find(Param1.getIntValue());
-        
-        if(pos != __hid_devices.end()) {
-
-            device = pos->second;
-
-            size_t length = Param2.getBytesLength();
-            int milliseconds = Param3.getIntValue();
-            int status = 0;
+        if(is_libhidusb_ready) {
             
-            std::vector<char>buf(length);
+            Param1.fromParamAtIndex(pParams, 1);
+            Param2.fromParamAtIndex(pParams, 2);
+            Param3.fromParamAtIndex(pParams, 3);
             
-            unsigned char *data = (unsigned char *)&buf[0];
+            std::lock_guard<std::mutex> lock(globalMutex);
             
-            if(Param3.getIntValue() == 0) {
-                status = hid_read(device,
-                                  data,
-                                  length);
+            std::map<uint32_t, hid_device*>::iterator pos = hid_devices.find(Param1.getIntValue());
+            
+            if(pos != hid_devices.end()) {
+                
+                hid_device *device = pos->second;
+                
+                size_t length = Param2.getBytesLength();
+                int milliseconds = Param3.getIntValue();
+                
+                if(length == 0) {
+                    ob_set_a(returnValue, L"error", ERROR_EMPTY_BUFFER);
+                }else{
+                    
+                    std::vector<unsigned char>buf(length);
+                    
+                    unsigned char *data = buf.data();
+                    
+                    int status = 0;
+                    
+                    if(milliseconds == 0) {
+                        status = hid_read(device, data, length);
+                    }else{
+                        status = hid_read_timeout(device, data, length, milliseconds);
+                    }
+                    
+                    set_status(returnValue, device, status);
+                    
+                    if(status >= 0) {
+                        /* return exactly the bytes read; empty if nothing was read */
+                        C_BLOB received;
+                        if(status > 0) {
+                            received.setBytes((const uint8_t *)data, (unsigned int)status);
+                        }
+                        received.toParamAtIndex(pParams, 2);
+                    }
+                }
+                
             }else{
-                status = hid_read_timeout(device,
-                                          data,
-                                          length,
-                                          milliseconds);
+                ob_set_a(returnValue, L"error", ERROR_INVALID_DEVICE);
             }
             
-            ob_set_b(returnValue, L"success", 0 == status);
-            
-            if(0 != status) {
-                
-                ob_set_a(returnValue, L"error", hid_error(device));
-                
-            }
-            
-            Param2.setBytes((const uint8_t *)data, (unsigned int)length);
-            
+        }else{
+            ob_set_a(returnValue, L"error", ERROR_NOT_READY);
         }
         
+    } catch(...) {
+        ob_set_a(returnValue, L"error", ERROR_EXCEPTION);
     }
-    
-    Param2.toParamAtIndex(pParams, 2);
     
     PA_ReturnObject(params, returnValue);
 }
@@ -494,39 +580,41 @@ void hid_send_feature_report(PA_PluginParameters params) {
     
     ob_set_b(returnValue, L"success", false);
     
-    if(is_libhidusb_ready) {
-
-        Param1.fromParamAtIndex(pParams, 1);
-        Param2.fromParamAtIndex(pParams, 2);
-
-        std::lock_guard<std::mutex> lock(globalMutex);
+    try {
         
-        hid_device *device = NULL;
-        
-        std::map<uint32_t, hid_device*>::iterator pos = __hid_devices.find(Param1.getIntValue());
-        
-        if(pos != __hid_devices.end()) {
-
-            device = pos->second;
-
-            unsigned char *data = (unsigned char *)Param2.getBytesPtr();
-            size_t length = Param2.getBytesLength();
-            int status = 0;
+        if(is_libhidusb_ready) {
             
-            status = hid_send_feature_report(device,
-                                             data,
-                                             length);
+            Param1.fromParamAtIndex(pParams, 1);
+            Param2.fromParamAtIndex(pParams, 2);
             
-            ob_set_b(returnValue, L"success", 0 == status);
+            std::lock_guard<std::mutex> lock(globalMutex);
             
-            if(0 != status) {
+            std::map<uint32_t, hid_device*>::iterator pos = hid_devices.find(Param1.getIntValue());
+            
+            if(pos != hid_devices.end()) {
                 
-                ob_set_a(returnValue, L"error", hid_error(device));
+                hid_device *device = pos->second;
                 
+                const unsigned char *data = (const unsigned char *)Param2.getBytesPtr();
+                size_t length = Param2.getBytesLength();
+                
+                if((length == 0) || (data == NULL)) {
+                    ob_set_a(returnValue, L"error", ERROR_EMPTY_BUFFER);
+                }else{
+                    int status = hid_send_feature_report(device, data, length);
+                    set_status(returnValue, device, status);
+                }
+                
+            }else{
+                ob_set_a(returnValue, L"error", ERROR_INVALID_DEVICE);
             }
-                        
+            
+        }else{
+            ob_set_a(returnValue, L"error", ERROR_NOT_READY);
         }
         
+    } catch(...) {
+        ob_set_a(returnValue, L"error", ERROR_EXCEPTION);
     }
         
     PA_ReturnObject(params, returnValue);
@@ -543,47 +631,58 @@ void hid_get_feature_report(PA_PluginParameters params) {
     
     ob_set_b(returnValue, L"success", false);
     
-    if(is_libhidusb_ready) {
-
-        Param1.fromParamAtIndex(pParams, 1);
-        Param2.fromParamAtIndex(pParams, 2);
-
-        std::lock_guard<std::mutex> lock(globalMutex);
+    try {
         
-        hid_device *device = NULL;
-        
-        std::map<uint32_t, hid_device*>::iterator pos = __hid_devices.find(Param1.getIntValue());
-        
-        if(pos != __hid_devices.end()) {
-
-            device = pos->second;
-
-            size_t length = Param2.getBytesLength();
-            int status = 0;
+        if(is_libhidusb_ready) {
             
-            std::vector<char>buf(length);
+            Param1.fromParamAtIndex(pParams, 1);
+            Param2.fromParamAtIndex(pParams, 2);
             
-            unsigned char *data = (unsigned char *)&buf[0];
+            std::lock_guard<std::mutex> lock(globalMutex);
             
-            status = hid_get_feature_report(device,
-                                            data,
-                                            length);
+            std::map<uint32_t, hid_device*>::iterator pos = hid_devices.find(Param1.getIntValue());
             
-            ob_set_b(returnValue, L"success", 0 == status);
-            
-            if(0 != status) {
+            if(pos != hid_devices.end()) {
                 
-                ob_set_a(returnValue, L"error", hid_error(device));
+                hid_device *device = pos->second;
                 
+                const unsigned char *input = (const unsigned char *)Param2.getBytesPtr();
+                size_t length = Param2.getBytesLength();
+                
+                if((length == 0) || (input == NULL)) {
+                    ob_set_a(returnValue, L"error", ERROR_EMPTY_BUFFER);
+                }else{
+                    
+                    /* keep the caller's bytes: data[0] is the report ID to request */
+                    std::vector<unsigned char>buf(input, input + length);
+                    
+                    unsigned char *data = buf.data();
+                    
+                    int status = hid_get_feature_report(device, data, length);
+                    
+                    set_status(returnValue, device, status);
+                    
+                    if(status >= 0) {
+                        /* report ID + report data, exactly as returned */
+                        C_BLOB received;
+                        if(status > 0) {
+                            received.setBytes((const uint8_t *)data, (unsigned int)status);
+                        }
+                        received.toParamAtIndex(pParams, 2);
+                    }
+                }
+                
+            }else{
+                ob_set_a(returnValue, L"error", ERROR_INVALID_DEVICE);
             }
             
-            Param2.setBytes((const uint8_t *)data, (unsigned int)length);
-            
+        }else{
+            ob_set_a(returnValue, L"error", ERROR_NOT_READY);
         }
         
+    } catch(...) {
+        ob_set_a(returnValue, L"error", ERROR_EXCEPTION);
     }
-    
-    Param2.toParamAtIndex(pParams, 2);
     
     PA_ReturnObject(params, returnValue);
 }
@@ -597,34 +696,42 @@ void hid_set_nonblocking(PA_PluginParameters params) {
     
     ob_set_b(returnValue, L"success", false);
     
-    if(is_libhidusb_ready) {
+    try {
         
-        PackagePtr pParams = (PackagePtr)params->fParameters;
-
-        Param1.fromParamAtIndex(pParams, 1);
-        Param2.fromParamAtIndex(pParams, 2);
-        
-        std::lock_guard<std::mutex> lock(globalMutex);
-        
-        hid_device *device = NULL;
-        
-        std::map<uint32_t, hid_device*>::iterator pos = __hid_devices.find(Param1.getIntValue());
-        
-        if(pos != __hid_devices.end()) {
-            device = pos->second;
+        if(is_libhidusb_ready) {
             
-            int status = hid_set_nonblocking(device, Param2.getIntValue());
+            PackagePtr pParams = (PackagePtr)params->fParameters;
             
-            ob_set_b(returnValue, L"success", 0 == status);
+            Param1.fromParamAtIndex(pParams, 1);
+            Param2.fromParamAtIndex(pParams, 2);
             
-            if(0 != status) {
+            std::lock_guard<std::mutex> lock(globalMutex);
+            
+            std::map<uint32_t, hid_device*>::iterator pos = hid_devices.find(Param1.getIntValue());
+            
+            if(pos != hid_devices.end()) {
                 
-                ob_set_a(returnValue, L"error", hid_error(device));
+                hid_device *device = pos->second;
                 
+                int status = hid_set_nonblocking(device, Param2.getIntValue());
+                
+                /* 0 on success, -1 on error */
+                ob_set_b(returnValue, L"success", 0 == status);
+                
+                if(0 != status) {
+                    ob_set_a(returnValue, L"error", hid_error(device));
+                }
+                
+            }else{
+                ob_set_a(returnValue, L"error", ERROR_INVALID_DEVICE);
             }
             
+        }else{
+            ob_set_a(returnValue, L"error", ERROR_NOT_READY);
         }
         
+    } catch(...) {
+        ob_set_a(returnValue, L"error", ERROR_EXCEPTION);
     }
     
     PA_ReturnObject(params, returnValue);
