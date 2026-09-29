@@ -165,10 +165,10 @@ static void set_status(PA_ObjectRef returnValue, hid_device *device, int status)
     }
 }
 
-#define ERROR_NOT_READY L"hidapi is not initialized"
-#define ERROR_INVALID_DEVICE L"invalid device"
-#define ERROR_EMPTY_BUFFER L"data must contain at least 1 byte (the report ID)"
-#define ERROR_EXCEPTION L"unexpected exception"
+#define HIDAPI_ERROR_NOT_READY L"hidapi is not initialized"
+#define HIDAPI_ERROR_INVALID_DEVICE L"invalid device"
+#define HIDAPI_ERROR_EMPTY_BUFFER L"data must contain at least 1 byte (the report ID)"
+#define HIDAPI_ERROR_EXCEPTION L"unexpected exception"
 
 #pragma mark -
 
@@ -247,7 +247,8 @@ void hid_open(PA_PluginParameters params) {
             if(len) {
                 
 #if VERSIONWIN
-                serial_number = Param3.getUTF16StringPtr();
+                /* PA_Unichar and wchar_t are both 16-bit UTF-16 on Windows; this cast is Windows-only */
+                serial_number = (const wchar_t *)Param3.getUTF16StringPtr();
 #else
                 CFStringRef str = CFStringCreateWithBytes(kCFAllocatorDefault,
                                                           (const UInt8 *)Param3.getUTF16StringPtr(),
@@ -289,11 +290,11 @@ void hid_open(PA_PluginParameters params) {
                 set_device_strings(returnValue, device);
             }
         }else{
-            ob_set_a(returnValue, L"error", ERROR_NOT_READY);
+            ob_set_a(returnValue, L"error", HIDAPI_ERROR_NOT_READY);
         }
         
     } catch(...) {
-        ob_set_a(returnValue, L"error", ERROR_EXCEPTION);
+        ob_set_a(returnValue, L"error", HIDAPI_ERROR_EXCEPTION);
     }
     
     PA_ReturnObject(params, returnValue);
@@ -406,11 +407,11 @@ void hid_open_path(PA_PluginParameters params) {
             }
             
         }else{
-            ob_set_a(returnValue, L"error", ERROR_NOT_READY);
+            ob_set_a(returnValue, L"error", HIDAPI_ERROR_NOT_READY);
         }
         
     } catch(...) {
-        ob_set_a(returnValue, L"error", ERROR_EXCEPTION);
+        ob_set_a(returnValue, L"error", HIDAPI_ERROR_EXCEPTION);
     }
     
     PA_ReturnObject(params, returnValue);
@@ -474,22 +475,22 @@ void hid_write(PA_PluginParameters params) {
                 size_t length = Param2.getBytesLength();
                 
                 if((length == 0) || (data == NULL)) {
-                    ob_set_a(returnValue, L"error", ERROR_EMPTY_BUFFER);
+                    ob_set_a(returnValue, L"error", HIDAPI_ERROR_EMPTY_BUFFER);
                 }else{
                     int status = hid_write(device, data, length);
                     set_status(returnValue, device, status);
                 }
                 
             }else{
-                ob_set_a(returnValue, L"error", ERROR_INVALID_DEVICE);
+                ob_set_a(returnValue, L"error", HIDAPI_ERROR_INVALID_DEVICE);
             }
             
         }else{
-            ob_set_a(returnValue, L"error", ERROR_NOT_READY);
+            ob_set_a(returnValue, L"error", HIDAPI_ERROR_NOT_READY);
         }
         
     } catch(...) {
-        ob_set_a(returnValue, L"error", ERROR_EXCEPTION);
+        ob_set_a(returnValue, L"error", HIDAPI_ERROR_EXCEPTION);
     }
         
     PA_ReturnObject(params, returnValue);
@@ -527,7 +528,7 @@ void hid_read(PA_PluginParameters params) {
                 int milliseconds = Param3.getIntValue();
                 
                 if(length == 0) {
-                    ob_set_a(returnValue, L"error", ERROR_EMPTY_BUFFER);
+                    ob_set_a(returnValue, L"error", HIDAPI_ERROR_EMPTY_BUFFER);
                 }else{
                     
                     std::vector<unsigned char>buf(length);
@@ -555,15 +556,15 @@ void hid_read(PA_PluginParameters params) {
                 }
                 
             }else{
-                ob_set_a(returnValue, L"error", ERROR_INVALID_DEVICE);
+                ob_set_a(returnValue, L"error", HIDAPI_ERROR_INVALID_DEVICE);
             }
             
         }else{
-            ob_set_a(returnValue, L"error", ERROR_NOT_READY);
+            ob_set_a(returnValue, L"error", HIDAPI_ERROR_NOT_READY);
         }
         
     } catch(...) {
-        ob_set_a(returnValue, L"error", ERROR_EXCEPTION);
+        ob_set_a(returnValue, L"error", HIDAPI_ERROR_EXCEPTION);
     }
     
     PA_ReturnObject(params, returnValue);
@@ -599,22 +600,22 @@ void hid_send_feature_report(PA_PluginParameters params) {
                 size_t length = Param2.getBytesLength();
                 
                 if((length == 0) || (data == NULL)) {
-                    ob_set_a(returnValue, L"error", ERROR_EMPTY_BUFFER);
+                    ob_set_a(returnValue, L"error", HIDAPI_ERROR_EMPTY_BUFFER);
                 }else{
                     int status = hid_send_feature_report(device, data, length);
                     set_status(returnValue, device, status);
                 }
                 
             }else{
-                ob_set_a(returnValue, L"error", ERROR_INVALID_DEVICE);
+                ob_set_a(returnValue, L"error", HIDAPI_ERROR_INVALID_DEVICE);
             }
             
         }else{
-            ob_set_a(returnValue, L"error", ERROR_NOT_READY);
+            ob_set_a(returnValue, L"error", HIDAPI_ERROR_NOT_READY);
         }
         
     } catch(...) {
-        ob_set_a(returnValue, L"error", ERROR_EXCEPTION);
+        ob_set_a(returnValue, L"error", HIDAPI_ERROR_EXCEPTION);
     }
         
     PA_ReturnObject(params, returnValue);
@@ -650,7 +651,7 @@ void hid_get_feature_report(PA_PluginParameters params) {
                 size_t length = Param2.getBytesLength();
                 
                 if((length == 0) || (input == NULL)) {
-                    ob_set_a(returnValue, L"error", ERROR_EMPTY_BUFFER);
+                    ob_set_a(returnValue, L"error", HIDAPI_ERROR_EMPTY_BUFFER);
                 }else{
                     
                     /* keep the caller's bytes: data[0] is the report ID to request */
@@ -673,15 +674,15 @@ void hid_get_feature_report(PA_PluginParameters params) {
                 }
                 
             }else{
-                ob_set_a(returnValue, L"error", ERROR_INVALID_DEVICE);
+                ob_set_a(returnValue, L"error", HIDAPI_ERROR_INVALID_DEVICE);
             }
             
         }else{
-            ob_set_a(returnValue, L"error", ERROR_NOT_READY);
+            ob_set_a(returnValue, L"error", HIDAPI_ERROR_NOT_READY);
         }
         
     } catch(...) {
-        ob_set_a(returnValue, L"error", ERROR_EXCEPTION);
+        ob_set_a(returnValue, L"error", HIDAPI_ERROR_EXCEPTION);
     }
     
     PA_ReturnObject(params, returnValue);
@@ -723,15 +724,15 @@ void hid_set_nonblocking(PA_PluginParameters params) {
                 }
                 
             }else{
-                ob_set_a(returnValue, L"error", ERROR_INVALID_DEVICE);
+                ob_set_a(returnValue, L"error", HIDAPI_ERROR_INVALID_DEVICE);
             }
             
         }else{
-            ob_set_a(returnValue, L"error", ERROR_NOT_READY);
+            ob_set_a(returnValue, L"error", HIDAPI_ERROR_NOT_READY);
         }
         
     } catch(...) {
-        ob_set_a(returnValue, L"error", ERROR_EXCEPTION);
+        ob_set_a(returnValue, L"error", HIDAPI_ERROR_EXCEPTION);
     }
     
     PA_ReturnObject(params, returnValue);
