@@ -16,6 +16,66 @@ Communicate with USB and Bluetooth HID (Human Interface Device) hardware — bar
 
 **Platforms:** macOS, Windows (32-bit and 64-bit)
 
+## Manual source versioning and publication
+
+The Actions entries are independent: **Bump** takes one required `patch`, `minor`,
+or `major` choice (default `patch`) and commits source metadata only to the
+selected branch. It never creates a tag or release or starts Build. **Build**
+has no custom inputs: select a ref with GitHub's built-in selector. Every job
+checks out that dispatch's immutable SHA; Build derives the canonical `X.Y.Z`
+version from source and never increments it.
+
+The original committed Bump header at `87442b3b64cf16eacc5aa98b7f9b4a91252eb533`
+explicitly coordinates marketing/current/plist versions, despite its
+marketing-only implementation. The migration keeps the existing `1.0.7`
+authority, repairing only stale `CURRENT_PROJECT_VERSION` values and version
+tokens in the copied **source** `English.lproj/InfoPlist.strings`. The plist's
+`$(MARKETING_VERSION)` reference and absent optional build key remain unchanged.
+Generated bundle metadata and binaries are not normalized in source control.
+Future bumps validate every source version/reference before rendering all
+changes, preserve encodings, line endings and unrelated bytes, and reject drift.
+
+Bump requires a clean checkout and the executable advertised-SHA pre-push guard.
+Its commit must be a nonempty source-only single-parent child of the selected
+SHA with the Copilot coauthor trailer. A changed, deleted, rewound or already
+updated branch fails closed. Pushes are nonforce with both follow-tags controls
+disabled. No tags are created.
+
+Build retains Windows x64 MSBuild followed by universal macOS `Default`, the
+10.13 deployment override, dependencies, resources, runtime signing, strict
+signature verification, ZIP/DMG notarization and DMG stapling. Cleanup removes
+only named generated files and target intermediates, never whole bundles or
+resource/dependency directories. Built plist/localization and exact architecture
+tokens are checked; each notary command must exit successfully and report JSON
+`Accepted`. There is no new default-branch-only restriction.
+
+Publication uses one repository-wide concurrency group across refs with
+cancellation disabled (not a FIFO guarantee). Before native execution and again
+after all native/sign/notary/staple gates, authenticated, paginated,
+draft-inclusive release enumeration and exact remote-tag absence checks must
+succeed. Initial checkout must be globally clean. Final publication retains
+known generated executable/plist/localization/signature dirt while independently
+checking both index and worktree source/configuration against the selected HEAD.
+Unexpected tracked/untracked inputs, index flags or a changed HEAD fail closed.
+
+The publisher creates a new tag ref at the selected SHA, verifies it, creates a
+new release ID, then uploads exact ZIP/DMG assets to that ID. It preserves the
+original empty release body with generated notes disabled. It never updates,
+clobbers, reuses, deletes, retries or rolls back publication. A race, API failure
+or partial upload leaves any newly created tag/release/assets intact and reports
+an error. **Manual recovery:** inspect the exact tag SHA, release ID and uploaded
+asset names/sizes/state; decide explicitly how to recover retained partial
+publication before another dispatch. Do not rerun expecting an overwrite.
+
+Offline verification (no native tools, credentials or Actions dispatch):
+`PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .github/tests -v`
+and `actionlint`. The native harness executes the actual workflow Bash and
+PowerShell with a closed PATH and native stubs; the original MSBuild CMD command
+is preserved verbatim and statically anchored to the intake commit.
+`python3 .github/tests/prove_bump.py --commit <final-migration-sha>` proves a
+genuine helper bump in a disposable detached/no-identity checkout and bare
+origin, runs the full suite and actionlint again there, and removes the fixture.
+
 ---
 
 ## Requirements & platform notes
