@@ -96,7 +96,9 @@ class ContractTests(unittest.TestCase):
         files = subprocess.check_output(["git", "ls-tree", "-r", "--name-only", INTAKE],
                                         cwd=ROOT, text=True).splitlines()
         excluded = {".github/workflows/bump-version.yml", ".github/workflows/release.yml",
-                    "HIDAPI.xcodeproj/project.pbxproj", "English.lproj/InfoPlist.strings", "README.md"}
+                    "HIDAPI.xcodeproj/project.pbxproj", "English.lproj/InfoPlist.strings", "README.md",
+                    # The ownership audit changes this helper, not the SDK or bundled binaries.
+                    "support/4DPlugin-JSON.cpp"}
         for path in files:
             if path not in excluded:
                 with self.subTest(path=path):
