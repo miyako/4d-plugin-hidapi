@@ -76,6 +76,70 @@ is preserved verbatim and statically anchored to the intake commit.
 genuine helper bump in a disposable detached/no-identity checkout and bare
 origin, runs the full suite and actionlint again there, and removes the fixture.
 
+## Native string ownership audit
+
+The audit baseline is `b79e1b7fa9cace5c30aeb62113ac1e2d01419a20`.
+Both source and committed bundle manifests declare the same nine commands, in
+dispatcher order (selectors 1-9). They use scalar text inputs and object/collection
+results, not text-array parameters. An `&Y` declaration would be array-capable,
+not proof of a text array; manifest absence was not used to exclude helpers.
+
+| First-party surface | Build/command reachability | Ownership result |
+|:--|:--|:--|
+| `4DPlugin-HIDAPI.cpp/.h` | All nine commands, both native builds | Strings are copied through JSON setters; returned objects/collections hand off their references. |
+| `support/4DPlugin-JSON.cpp/.h` | Whole translation unit in both builds; commands call string/numeric/boolean setters | Four string setters now start Undefined before accepting an independently allocated string; no initial owned empty is overwritten. |
+| JSON property getters | Compiled, but no current command callers | String/scalar getters copy then clear owning results, including mismatches. Object/collection getters transfer matching references to callers and clear mismatches. Callers must dispose successful reference results. |
+| JSON stringify and other setters | Compiled shared helpers; most dormant | Synchronous stringify uses an independent object copy and clears its argument and owning result on both result-type paths. Existing object/collection setter handoffs remain unchanged. |
+| `C_TEXT`, `C_LONGINT`, `C_BLOB` and headers | Both builds | Text reads copy into C++ storage; parameter/return writes use the engine content setter, not struct-transfer array insertion. Integer/blob helpers add no string owners. |
+| `ARRAY_TEXT.cpp/.h` | Tracked but absent from both native source lists and all command callers | Input strings are borrowed and copied; normal output insertion transfers independent strings without disposing them afterward. Allocation/resize failure limitation is deferred below. |
+| Disabled indexed-string block in `hid_open_path` | Comment only, not compiled | Already documented invalid platform conversion/lifetime paths; also contains an initial-empty overwrite and double cleanup after shallow string assignment. Must not be enabled without a separate fix. |
+
+No first-party `CPicture`, pointer wrapper, callback executor or additional
+platform command implementation is tracked. Third-party `include/hidapi`,
+`include/json` and prebuilt libraries/bundles are excluded. The bundled SDK is
+reviewed as the contract, not rewritten: implementation header says `rev: v14`,
+public header `rev: v13`; neither identifies a verified upstream release.
+Its exact Git blobs are `62f745e91d81ef2c3c901c656ea8e175d3b173e8` (`.c`)
+and `528bf1d2552df08d6a8b1bc95011a9b72934ad5c` (`.h`).
+Guidance follows `miyako/skills` merged PRs 69 and 71.
+
+`PA_CreateVariable(eVK_Unistring)` creates an owned empty string, which can be
+allocated or null in the host. `PA_SetStringVariable` shallow-assigns without
+releasing that initial owner. `PA_GetObjectProperty` explicitly returns an
+owning variable; `PA_GetStringVariable` exposes its string until cleanup.
+`PA_SetStringInArray` disposes the old element and transfers the input only for
+an accepted type/data/index destination (including index zero); rejection
+leaves the caller owning its input. Content setters are a different contract.
+
+On macOS with Xcode tools, run
+`PYTHONDONTWRITEBYTECODE=1 python3 .github/tests/prove_string_ownership.py`.
+It compiles the **actual helper sources and full unchanged SDK**, with only
+engine callbacks simulated, against the immutable baseline and then the current
+tree. Each baseline string-setter overload leaks three allocated empties after
+three calls; property-getter cases leak five owning strings in either empty
+representation. The fixed source passes all cases. ASan/UBSan cover exact ASCII,
+BMP, supplementary UTF-16 surrogate pairs and empty content, replacement,
+borrowed array copies, independent transfers, shrink/clear, rejected destinations,
+reference handoffs/type mismatches, and stringify results. Real CoreFoundation
+conversions preserve byte capacities and UTF-16 lengths; no conversion-length
+proxy is used. Explicit SDK string/handle/reference accounting must finish at
+zero; macOS LeakSanitizer is disabled. The suite skips this native harness on
+other operating systems.
+
+**Deferred limitation:** the dormant array wrapper trusts `PA_ResizeArray`.
+Failure injection confirms that this SDK advances the logical count even when
+handle growth fails, leaving physical capacity unchanged. The regression checks
+that condition without executing an unsafe write; enabling this wrapper requires
+separate allocation/capacity/error handling. See
+[the deferred issue](https://github.com/miyako/4d-plugin-hidapi/issues/3).
+This audit is not certification of dormant failure paths.
+
+Validation uses direct native compilation and temporary sanitizer executables,
+not Xcode/MSBuild release targets or publication workflows. No tracked binaries
+are rebuilt. Host services are modeled from this bundled SDK; no actual 4D host,
+Windows execution, HID hardware test or full cross-platform plugin link is
+claimed.
+
 ---
 
 ## Requirements & platform notes
